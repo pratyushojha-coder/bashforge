@@ -36,21 +36,17 @@ def draw_ui(stdscr):
         stdscr.clear()
         height, width = stdscr.getmaxyx()
 
-        # Title
         stdscr.addstr(0, 2, "BashForge - Terminal Bash Editor", curses.A_BOLD)
 
-        # Buttons
         stdscr.addstr(2, 2, "[F5 RUN]", curses.A_REVERSE)
         stdscr.addstr(2, 12, "[F6 RESET]", curses.A_REVERSE)
         stdscr.addstr(2, 24, "[F10 EXIT]", curses.A_REVERSE)
 
-        # Editor
         stdscr.addstr(4, 2, "Code:")
 
         for i, line in enumerate(code_buffer):
             stdscr.addstr(5 + i, 2, line)
 
-        # Output
         stdscr.addstr(height // 2, 2, "Output:")
 
         for i, line in enumerate(output_buffer[:height//2 - 2]):

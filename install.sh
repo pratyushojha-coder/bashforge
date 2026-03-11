@@ -14,7 +14,6 @@ curl -L https://raw.githubusercontent.com/pratyushojha-coder/bashforge/main/bash
 
 chmod +x $INSTALL_DIR/bashforge.py
 
-# Create launcher
 sudo tee $BIN_DIR/bashforge > /dev/null <<EOF
 #!/bin/bash
 python3 $INSTALL_DIR/bashforge.py
