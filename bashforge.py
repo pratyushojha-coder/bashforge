@@ -355,12 +355,50 @@ class BashForge:
 
     # ── output panel  (with live stdin row) ──────────────────
     def _build_output(self, parent):
-        vscr = tk.Scrollbar(parent, orient="vertical",
+        # Build bottom-up: stdin row first, then text fills the rest
+        tk.Frame(parent, bg=BORDER, height=1).pack(side="bottom", fill="x")
+        stdin_row = tk.Frame(parent, bg=BG_OUTPUT, height=38)
+        stdin_row.pack(side="bottom", fill="x")
+        stdin_row.pack_propagate(False)
+
+        self._stdin_lbl = tk.Label(
+            stdin_row, text="stdin ❯",
+            bg=BG_OUTPUT, fg=FG_COMMENT,
+            font=self.mono_font)
+        self._stdin_lbl.pack(side="left", padx=(10, 6))
+
+        self._stdin_hint = tk.Label(
+            stdin_row, text="idle",
+            bg=BG_OUTPUT, fg=FG_COMMENT,
+            font=("Segoe UI", 8))
+        self._stdin_hint.pack(side="right", padx=10)
+
+        self._stdin_entry = tk.Entry(
+            stdin_row,
+            bg=ACTIVE_BG, fg=FG_CYAN,
+            insertbackground=FG_CYAN,
+            disabledbackground=ACTIVE_BG,
+            disabledforeground="#334455",
+            font=self.mono_font,
+            relief="flat", borderwidth=0,
+            highlightthickness=1,
+            highlightcolor=FG_CYAN,
+            highlightbackground=BORDER,
+            state="disabled",
+        )
+        self._stdin_entry.pack(side="left", fill="x", expand=True, padx=(0, 6), pady=6)
+        self._stdin_entry.bind("<Return>", self._send_stdin)
+
+        # Text output fills all remaining space above stdin row
+        text_frame = tk.Frame(parent, bg=BG_OUTPUT)
+        text_frame.pack(side="top", fill="both", expand=True)
+
+        vscr = tk.Scrollbar(text_frame, orient="vertical",
                              bg=BG_TOOLBAR, troughcolor=BG_OUTPUT, width=10)
         vscr.pack(side="right", fill="y")
 
         self.output = tk.Text(
-            parent,
+            text_frame,
             bg=BG_OUTPUT, fg=FG_DEFAULT,
             font=self.mono_font_sm,
             state="disabled", relief="flat",
@@ -370,7 +408,7 @@ class BashForge:
             selectbackground=SEL_BG,
         )
         vscr.config(command=self.output.yview)
-        self.output.pack(fill="both", expand=True)
+        self.output.pack(side="left", fill="both", expand=True)
 
         for tag, fg in [("stdout",  FG_DEFAULT), ("stderr",  FG_RED),
                         ("info",    FG_CYAN),    ("success", FG_GREEN),
