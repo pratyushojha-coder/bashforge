@@ -4,27 +4,33 @@ import tkinter as tk
 from tkinter import filedialog
 import subprocess
 import threading
+import os
+import pty
+import sys
 
 class BashForge:
 
     def __init__(self, root):
 
         self.root = root
-        self.root.title("BashForge")
-        self.root.geometry("1000x650")
+        self.root.title("BashForge IDE")
+        self.root.geometry("1000x700")
 
-        self.create_ui()
+        self.process = None
+        self.master_fd = None
 
-    def create_ui(self):
+        self.build_ui()
+
+    def build_ui(self):
 
         toolbar = tk.Frame(self.root, bg="#2b2b2b")
         toolbar.pack(fill="x")
 
         tk.Button(toolbar, text="Run", command=self.run_code).pack(side="left", padx=5)
-        tk.Button(toolbar, text="Reset", command=self.reset).pack(side="left", padx=5)
+        tk.Button(toolbar, text="Stop", command=self.stop_process).pack(side="left", padx=5)
         tk.Button(toolbar, text="Open", command=self.open_file).pack(side="left", padx=5)
         tk.Button(toolbar, text="Save", command=self.save_file).pack(side="left", padx=5)
-        tk.Button(toolbar, text="Exit", command=self.root.quit).pack(side="right", padx=5)
+        tk.Button(toolbar, text="Clear", command=self.clear_terminal).pack(side="left", padx=5)
 
         editor_frame = tk.Frame(self.root)
         editor_frame.pack(fill="both", expand=True)
@@ -34,56 +40,83 @@ class BashForge:
             bg="#1e1e1e",
             fg="white",
             insertbackground="white",
-            font=("Consolas",12)
+            font=("Consolas", 12)
         )
 
-        scrollbar = tk.Scrollbar(editor_frame, command=self.editor.yview)
-        self.editor.configure(yscrollcommand=scrollbar.set)
+        scroll = tk.Scrollbar(editor_frame, command=self.editor.yview)
+        self.editor.configure(yscrollcommand=scroll.set)
 
-        scrollbar.pack(side="right", fill="y")
+        scroll.pack(side="right", fill="y")
         self.editor.pack(fill="both", expand=True)
 
-        terminal_label = tk.Label(self.root, text="Terminal Output")
-        terminal_label.pack(anchor="w")
+        terminal_label = tk.Label(self.root, text="Terminal", bg="#222", fg="white")
+        terminal_label.pack(fill="x")
 
         self.terminal = tk.Text(
             self.root,
-            height=10,
+            height=12,
             bg="black",
             fg="lime",
-            font=("Consolas",11)
+            insertbackground="white",
+            font=("Consolas", 11)
         )
 
         self.terminal.pack(fill="x")
+
+        self.terminal.bind("<Return>", self.send_input)
 
     def run_code(self):
 
         code = self.editor.get("1.0", tk.END)
 
-        self.terminal.delete("1.0", tk.END)
+        self.clear_terminal()
 
-        thread = threading.Thread(target=self.execute_code, args=(code,))
+        thread = threading.Thread(target=self.start_shell, args=(code,))
+        thread.daemon = True
         thread.start()
 
-    def execute_code(self, code):
+    def start_shell(self, code):
 
-        process = subprocess.Popen(
+        self.master_fd, slave_fd = pty.openpty()
+
+        self.process = subprocess.Popen(
             ["bash"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            text=True,
+            close_fds=True
         )
 
-        stdout, stderr = process.communicate(code)
+        os.write(self.master_fd, code.encode())
 
-        output = stdout + stderr
+        while True:
+            try:
+                data = os.read(self.master_fd, 1024).decode()
+                self.terminal.insert(tk.END, data)
+                self.terminal.see(tk.END)
+            except OSError:
+                break
 
-        self.terminal.insert(tk.END, output)
+    def send_input(self, event):
 
-    def reset(self):
+        if self.master_fd is None:
+            return
 
-        self.editor.delete("1.0", tk.END)
+        line = self.terminal.get("insert linestart", "insert lineend")
+
+        os.write(self.master_fd, (line + "\n").encode())
+
+        return "break"
+
+    def stop_process(self):
+
+        if self.process:
+            self.process.terminate()
+            self.process = None
+
+    def clear_terminal(self):
+
         self.terminal.delete("1.0", tk.END)
 
     def open_file(self):
@@ -91,21 +124,22 @@ class BashForge:
         file = filedialog.askopenfilename()
 
         if file:
-            with open(file,"r") as f:
+            with open(file, "r") as f:
                 content = f.read()
 
-            self.editor.delete("1.0",tk.END)
-            self.editor.insert(tk.END,content)
+            self.editor.delete("1.0", tk.END)
+            self.editor.insert(tk.END, content)
 
     def save_file(self):
 
         file = filedialog.asksaveasfilename(defaultextension=".sh")
 
         if file:
-            code = self.editor.get("1.0",tk.END)
+            code = self.editor.get("1.0", tk.END)
 
-            with open(file,"w") as f:
+            with open(file, "w") as f:
                 f.write(code)
+
 
 if __name__ == "__main__":
 
