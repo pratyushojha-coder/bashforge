@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 BashForge IDE  –  DevOps-focused Bash editor for Ubuntu
-Layout: [Editor | Output (top) / Terminal (bottom)]
+Layout : LEFT = editor  |  RIGHT-TOP = script output  |  RIGHT-BOTTOM = terminal
+Stdin  : Output panel has a live  "stdin ❯"  input row that feeds the running
+         script in real time – so every  `read`  prompt works naturally.
 """
 
 import tkinter as tk
@@ -13,6 +15,14 @@ import re
 import threading
 import queue
 import signal
+import sys
+
+# ── try to import pty (Linux only) ──────────────────────────────────────────
+try:
+    import pty, select
+    HAS_PTY = True
+except ImportError:
+    HAS_PTY = False          # Windows / no pty – fall back to pipe mode
 
 # ────────────────────────────────────────────────────────────
 #  Colour tokens  (GitHub-dark palette)
@@ -78,7 +88,7 @@ SNIPPETS = {
     "check root":        'if [[ $EUID -ne 0 ]]; then\n    echo "This script must be run as root" >&2\n    exit 1\nfi\n',
     "log function":      'log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*" | tee -a "${LOGFILE:-/tmp/script.log}"; }\n',
     "check command":     'command -v docker &>/dev/null || { echo "docker not found"; exit 1; }\n',
-    "read input":        'read -rp "Enter value: " USER_INPUT\necho "You entered: ${USER_INPUT}"\n',
+    "read input":        'read -rp "Enter your name: " name\necho "Hello, $name!"\n',
     "case statement":    'case "${ENV}" in\n    prod)   ENDPOINT="https://prod.example.com" ;;\n    stage)  ENDPOINT="https://stage.example.com" ;;\n    *)      echo "Unknown env: ${ENV}"; exit 1 ;;\nesac\n',
     "docker run":        'docker run -d \\\n    --name myapp \\\n    --restart unless-stopped \\\n    -p 8080:80 \\\n    -e ENV_VAR=value \\\n    -v /data:/app/data \\\n    myimage:latest\n',
     "kubectl apply":     'kubectl apply -f deployment.yaml\nkubectl rollout status deployment/myapp\nkubectl get pods -l app=myapp\n',
@@ -87,7 +97,6 @@ SNIPPETS = {
     "color output":      'RED="\\033[0;31m"; GREEN="\\033[0;32m"; YELLOW="\\033[1;33m"; NC="\\033[0m"\necho -e "${GREEN}Success${NC}"\necho -e "${RED}Error${NC}"\necho -e "${YELLOW}Warning${NC}"\n',
     "retry loop":        'MAX_RETRY=5; RETRY=0\nuntil some_command; do\n    RETRY=$((RETRY+1))\n    [[ $RETRY -eq $MAX_RETRY ]] && { echo "Max retries reached"; exit 1; }\n    echo "Retry $RETRY/$MAX_RETRY in 5s..."\n    sleep 5\ndone\n',
     "heredoc":           "cat <<'EOF' > /tmp/config.conf\n[section]\nkey=value\nEOF\n",
-    "env var default":   'VALUE="${MY_VAR:-default_value}"\n',
     "array ops":         'arr=("a" "b" "c")\necho "${arr[@]}"\necho "${#arr[@]}"\nfor i in "${!arr[@]}"; do echo "$i: ${arr[$i]}"; done\n',
 }
 
@@ -130,25 +139,24 @@ class BashForge:
         self.root.configure(bg=BG_MAIN)
         self.root.minsize(900, 580)
 
-        # state
-        self.current_file   = None
-        self.modified       = False
-        self._search_idx    = "1.0"
-        self._snippet_win   = None
-        self._run_proc      = None       # running script process
-        self._run_tmp       = None       # temp script path
-        self._cwd           = os.path.expanduser("~")
-        self._term_hist     = []
-        self._term_hist_idx = -1
-        self._out_queue     = queue.Queue()  # thread → GUI for script output
+        self.current_file    = None
+        self.modified        = False
+        self._search_idx     = "1.0"
+        self._snippet_win    = None
+        self._run_proc       = None      # running script Popen object
+        self._pty_master_fd  = None      # pty master fd (Linux)
+        self._cwd            = os.path.expanduser("~")
+        self._term_hist      = []
+        self._term_hist_idx  = -1
+        self._out_queue      = queue.Queue()   # thread → GUI output
+        self._stdin_queue    = queue.Queue()   # GUI → script stdin
 
         self._pick_font()
         self._build_ui()
         self._bind_keys()
         self._syntax_highlight()
         self._update_status()
-        # poll output queue every 50 ms
-        self.root.after(50, self._poll_output_queue)
+        self.root.after(40, self._poll_output_queue)
 
     # ── font ─────────────────────────────────────────────────
     def _pick_font(self):
@@ -158,7 +166,7 @@ class BashForge:
         self.mono_font    = (name, 12)
         self.mono_font_sm = (name, 10)
 
-    # ── helpers ───────────────────────────────────────────────
+    # ── reusable helpers ──────────────────────────────────────
     def _mk_btn(self, parent, text, cmd, fg=FG_DIM, icon=""):
         lbl = f"{icon}  {text}" if icon else text
         b = tk.Button(parent, text=lbl, command=cmd,
@@ -171,24 +179,23 @@ class BashForge:
         b.bind("<Leave>", lambda e: b.config(bg=BG_TOOLBAR))
         return b
 
-    def _panel_header(self, parent, title, right_text=""):
+    def _panel_header(self, parent, title, hint=""):
         hdr = tk.Frame(parent, bg=BG_PANEL_HDR, height=26)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
         tk.Label(hdr, text=f"  {title}", bg=BG_PANEL_HDR,
                  fg=FG_DIM, font=("Segoe UI", 8, "bold")).pack(side="left", padx=4)
-        if right_text:
-            tk.Label(hdr, text=f"{right_text}  ", bg=BG_PANEL_HDR,
+        if hint:
+            tk.Label(hdr, text=f"{hint}  ", bg=BG_PANEL_HDR,
                      fg=FG_COMMENT, font=("Segoe UI", 7)).pack(side="right")
         tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")
-        return hdr
 
     # ────────────────────────────────────────────────────────
-    #  UI build
+    #  Top-level UI assembly
     # ────────────────────────────────────────────────────────
     def _build_ui(self):
         self._build_toolbar()
-        self._build_find_bar()   # hidden by default
+        self._build_find_bar()
         self._build_panes()
         self._build_statusbar()
 
@@ -202,40 +209,38 @@ class BashForge:
         L = tk.Frame(tb, bg=BG_TOOLBAR)
         L.pack(side="left", padx=6, pady=5)
 
-        self._mk_btn(L, "New",      self.new_file,       FG_DIM,    "⊕")
-        self._mk_btn(L, "Open",     self.open_file,      FG_DIM,    "📂")
-        self._mk_btn(L, "Save",     self.save_file,      FG_DIM,    "💾")
-        self._mk_btn(L, "Save As",  self.save_as,        FG_DIM,    "📝")
+        self._mk_btn(L, "New",      self.new_file,    FG_DIM,  "⊕")
+        self._mk_btn(L, "Open",     self.open_file,   FG_DIM,  "📂")
+        self._mk_btn(L, "Save",     self.save_file,   FG_DIM,  "💾")
+        self._mk_btn(L, "Save As",  self.save_as,     FG_DIM,  "📝")
         tk.Frame(L, bg=BORDER, width=1, height=22).pack(side="left", padx=6)
 
-        self.run_btn = self._mk_btn(L, "Run  Ctrl+↵",          self.run_script,    FG_GREEN, "▶")
-        self._mk_btn(L, "Run with Input",                       self.run_with_input, FG_CYAN,  "▶?")
-        self._mk_btn(L, "Stop",                                 self.stop_script,    FG_RED,   "■")
+        self.run_btn = self._mk_btn(L, "Run  Ctrl+↵",  self.run_script,  FG_GREEN, "▶")
+        self._mk_btn(L, "Stop",  self.stop_script, FG_RED,   "■")
         tk.Frame(L, bg=BORDER, width=1, height=22).pack(side="left", padx=6)
 
-        self._mk_btn(L, "Comment  Ctrl+/", self.toggle_comment, FG_COMMENT, "#")
-        self._mk_btn(L, "Snippets",  self.show_snippets,  FG_PURPLE, "⋯")
-        self._mk_btn(L, "Find/Replace  Ctrl+F", self.open_find_bar, FG_YELLOW, "🔍")
+        self._mk_btn(L, "Comment  Ctrl+/",      self.toggle_comment, FG_COMMENT, "#")
+        self._mk_btn(L, "Snippets",              self.show_snippets,  FG_PURPLE,  "⋯")
+        self._mk_btn(L, "Find/Replace  Ctrl+F", self.open_find_bar,  FG_YELLOW,  "🔍")
 
         R = tk.Frame(tb, bg=BG_TOOLBAR)
         R.pack(side="right", padx=6, pady=5)
-        self._mk_btn(R, "Clear Editor",    self.clear_editor,    FG_DIM, "⊗")
-        self._mk_btn(R, "Clear Output",    self.clear_output,    FG_DIM, "⊘")
-        self._mk_btn(R, "Clear Terminal",  self.clear_terminal,  FG_DIM, "⊘")
+        self._mk_btn(R, "Clear Editor",   self.clear_editor,   FG_DIM, "⊗")
+        self._mk_btn(R, "Clear Output",   self.clear_output,   FG_DIM, "⊘")
+        self._mk_btn(R, "Clear Terminal", self.clear_terminal, FG_DIM, "⊘")
         tk.Frame(R, bg=BORDER, width=1, height=22).pack(side="left", padx=6)
         self._mk_btn(R, "Exit", self.root.quit, FG_RED, "✕")
 
-    # ── find/replace bar ─────────────────────────────────────
+    # ── find/replace bar (hidden until Ctrl+F) ───────────────
     def _build_find_bar(self):
         self.find_bar = tk.Frame(self.root, bg=BG_PANEL_HDR, pady=5)
-        # NOT packed yet – shown on demand
 
         inner = tk.Frame(self.find_bar, bg=BG_PANEL_HDR)
         inner.pack(fill="x", padx=10)
 
         def lbl(t):
-            tk.Label(inner, text=t, bg=BG_PANEL_HDR,
-                     fg=FG_DIM, font=FONT_UI).pack(side="left", padx=(8, 3))
+            tk.Label(inner, text=t, bg=BG_PANEL_HDR, fg=FG_DIM,
+                     font=FONT_UI).pack(side="left", padx=(8, 3))
 
         def ent(w):
             e = tk.Entry(inner, bg=ACTIVE_BG, fg=FG_DEFAULT,
@@ -251,67 +256,61 @@ class BashForge:
             b = tk.Button(inner, text=t, command=cmd,
                           bg=ACTIVE_BG, fg=FG_ACCENT, relief="flat",
                           font=FONT_UI, padx=7, pady=1, cursor="hand2",
-                          borderwidth=0,
-                          activebackground=HOVER_BG,
+                          borderwidth=0, activebackground=HOVER_BG,
                           activeforeground=FG_ACCENT)
             b.pack(side="left", padx=2)
 
         lbl("Find:")
         self.find_entry = ent(30)
-        self.find_entry.bind("<Return>",  lambda e: self.find_next())
-        self.find_entry.bind("<Escape>",  lambda e: self.close_find_bar())
+        self.find_entry.bind("<Return>", lambda e: self.find_next())
+        self.find_entry.bind("<Escape>", lambda e: self.close_find_bar())
 
         lbl("Replace:")
         self.replace_entry = ent(24)
 
-        act("▶ Next",       self.find_next)
-        act("◀ Prev",       self.find_prev)
-        act("Replace",      self.replace_one)
-        act("Replace All",  self.replace_all)
-        act("✕ Close",      self.close_find_bar)
+        act("▶ Next",      self.find_next)
+        act("◀ Prev",      self.find_prev)
+        act("Replace",     self.replace_one)
+        act("Replace All", self.replace_all)
+        act("✕ Close",     self.close_find_bar)
 
         tk.Frame(self.find_bar, bg=BORDER, height=1).pack(fill="x", pady=(4, 0))
 
     # ── three-panel layout ────────────────────────────────────
     def _build_panes(self):
-        # Outer horizontal split: LEFT=editor  RIGHT=output+terminal
         self.h_pane = tk.PanedWindow(
             self.root, orient="horizontal",
-            bg=BORDER, sashwidth=5, sashrelief="flat", sashpad=0
-        )
+            bg=BORDER, sashwidth=5, sashrelief="flat", sashpad=0)
         self.h_pane.pack(fill="both", expand=True)
 
-        # ── LEFT: editor panel ────────────────────────────────
+        # LEFT – editor
         ed_panel = tk.Frame(self.h_pane, bg=BG_EDITOR)
         self._panel_header(ed_panel, "EDITOR",
                            "Ctrl+/ comment  |  Ctrl+D dup  |  Tab indent")
         self._build_editor(ed_panel)
         self.h_pane.add(ed_panel, minsize=350)
 
-        # ── RIGHT: vertical split  output / terminal ──────────
+        # RIGHT – vertical split
         self.v_pane = tk.PanedWindow(
             self.h_pane, orient="vertical",
-            bg=BORDER, sashwidth=5, sashrelief="flat", sashpad=0
-        )
+            bg=BORDER, sashwidth=5, sashrelief="flat", sashpad=0)
         self.h_pane.add(self.v_pane, minsize=320)
 
-        # output panel (script stdout/stderr)
         out_panel = tk.Frame(self.v_pane, bg=BG_OUTPUT)
-        self._panel_header(out_panel, "SCRIPT OUTPUT", "read-only")
+        self._panel_header(out_panel, "SCRIPT OUTPUT",
+                           "type below ↓ to send stdin while script runs")
         self._build_output(out_panel)
-        self.v_pane.add(out_panel, minsize=100)
+        self.v_pane.add(out_panel, minsize=120)
 
-        # terminal panel (interactive shell)
         term_panel = tk.Frame(self.v_pane, bg=BG_TERMINAL)
         self._panel_header(term_panel, "TERMINAL",
                            "↑↓ history  |  Tab complete  |  cd / clear")
         self._build_terminal(term_panel)
         self.v_pane.add(term_panel, minsize=100)
 
-        # initial sizes
         self.root.update_idletasks()
-        self.h_pane.paneconfigure(ed_panel,  width=780)
-        self.v_pane.paneconfigure(out_panel, height=360)
+        self.h_pane.paneconfigure(ed_panel,   width=780)
+        self.v_pane.paneconfigure(out_panel,  height=380)
 
     # ── editor ────────────────────────────────────────────────
     def _build_editor(self, parent):
@@ -354,7 +353,7 @@ class BashForge:
         self.editor.yview(*a)
         self.line_nums.yview_moveto(self.editor.yview()[0])
 
-    # ── output panel ─────────────────────────────────────────
+    # ── output panel  (with live stdin row) ──────────────────
     def _build_output(self, parent):
         vscr = tk.Scrollbar(parent, orient="vertical",
                              bg=BG_TOOLBAR, troughcolor=BG_OUTPUT, width=10)
@@ -373,11 +372,72 @@ class BashForge:
         vscr.config(command=self.output.yview)
         self.output.pack(fill="both", expand=True)
 
-        # colour tags
         for tag, fg in [("stdout",  FG_DEFAULT), ("stderr",  FG_RED),
                         ("info",    FG_CYAN),    ("success", FG_GREEN),
-                        ("warn",    FG_YELLOW),  ("divider", FG_DIM)]:
+                        ("warn",    FG_YELLOW),  ("input",   FG_CYAN)]:
             self.output.tag_config(tag, foreground=fg)
+
+        # ── live stdin input row ──────────────────────────────
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")
+        stdin_row = tk.Frame(parent, bg=BG_OUTPUT)
+        stdin_row.pack(fill="x", side="bottom")
+
+        self._stdin_lbl = tk.Label(
+            stdin_row, text="stdin ❯",
+            bg=BG_OUTPUT, fg=FG_COMMENT,
+            font=self.mono_font)
+        self._stdin_lbl.pack(side="left", padx=(10, 6), pady=5)
+
+        self._stdin_entry = tk.Entry(
+            stdin_row,
+            bg=BG_OUTPUT, fg=FG_CYAN,
+            insertbackground=FG_CYAN,
+            disabledbackground=BG_OUTPUT,
+            disabledforeground="#2a3a4a",
+            font=self.mono_font,
+            relief="flat", borderwidth=0, highlightthickness=1,
+            highlightcolor=FG_CYAN,
+            highlightbackground=BORDER,
+            state="disabled",
+        )
+        self._stdin_entry.pack(side="left", fill="x", expand=True, pady=4)
+        self._stdin_entry.bind("<Return>", self._send_stdin)
+
+        self._stdin_hint = tk.Label(
+            stdin_row, text="idle",
+            bg=BG_OUTPUT, fg=FG_COMMENT,
+            font=("Segoe UI", 8))
+        self._stdin_hint.pack(side="right", padx=10)
+
+    def _stdin_set_active(self, active: bool):
+        """Enable or disable the stdin entry row."""
+        if active:
+            self._stdin_entry.config(state="normal")
+            self._stdin_lbl.config(fg=FG_CYAN)
+            self._stdin_hint.config(text="type & press Enter to send")
+            self._stdin_entry.focus_set()
+        else:
+            self._stdin_entry.config(state="disabled")
+            self._stdin_entry.delete(0, tk.END)
+            self._stdin_lbl.config(fg=FG_COMMENT)
+            self._stdin_hint.config(text="idle")
+
+    def _send_stdin(self, _=None):
+        """Called when user presses Enter in the stdin row."""
+        line = self._stdin_entry.get()
+        self._stdin_entry.delete(0, tk.END)
+        self._ow(f"❯ {line}\n", "input")   # echo to output panel
+
+        # route to the correct backend
+        if self._pty_master_fd is not None:
+            # pty mode – write directly to the master fd
+            try:
+                os.write(self._pty_master_fd, (line + "\n").encode())
+            except OSError:
+                pass
+        elif self._run_proc and self._run_proc.poll() is None:
+            # pipe mode – push into the queue for the writer thread
+            self._stdin_queue.put(line + "\n")
 
     # ── terminal panel ───────────────────────────────────────
     def _build_terminal(self, parent):
@@ -398,28 +458,25 @@ class BashForge:
         vscr.config(command=self.terminal.yview)
         self.terminal.pack(fill="both", expand=True)
 
-        # input row
         tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")
         inp_row = tk.Frame(parent, bg=BG_TERMINAL)
-        inp_row.pack(fill="x", padx=6, pady=4)
+        inp_row.pack(fill="x", side="bottom", padx=6, pady=4)
         tk.Label(inp_row, text="$  ", bg=BG_TERMINAL, fg=FG_GREEN,
                  font=self.mono_font).pack(side="left")
         self.term_input = tk.Entry(
             inp_row, bg=BG_TERMINAL, fg=FG_DEFAULT,
             insertbackground=FG_ACCENT, font=self.mono_font,
-            relief="flat", borderwidth=0, highlightthickness=0
-        )
+            relief="flat", borderwidth=0, highlightthickness=0)
         self.term_input.pack(side="left", fill="x", expand=True)
-        self.term_input.bind("<Return>",  self._term_exec)
-        self.term_input.bind("<Up>",      self._term_hist_prev)
-        self.term_input.bind("<Down>",    self._term_hist_next)
-        self.term_input.bind("<Tab>",     self._term_tab_complete)
+        self.term_input.bind("<Return>", self._term_exec)
+        self.term_input.bind("<Up>",     self._term_hist_prev)
+        self.term_input.bind("<Down>",   self._term_hist_next)
+        self.term_input.bind("<Tab>",    self._term_tab_complete)
 
-        # colour tags
-        for tag, fg in [("stdout",  FG_DEFAULT), ("stderr",  FG_RED),
-                        ("cmd",     FG_ACCENT),  ("info",    FG_CYAN),
-                        ("success", FG_GREEN),   ("warn",    FG_YELLOW),
-                        ("prompt",  FG_GREEN)]:
+        for tag, fg in [("stdout", FG_DEFAULT), ("stderr", FG_RED),
+                        ("cmd",    FG_ACCENT),  ("info",   FG_CYAN),
+                        ("success",FG_GREEN),   ("warn",   FG_YELLOW),
+                        ("prompt", FG_GREEN)]:
             self.terminal.tag_config(tag, foreground=fg)
 
         self._tw("BashForge terminal ready.\n", "info")
@@ -435,17 +492,14 @@ class BashForge:
         self.st_file = tk.Label(sb, text="  Untitled.sh",
                                 bg=BG_STATUSBAR, fg=FG_ACCENT, font=("Segoe UI", 8))
         self.st_file.pack(side="left", padx=4)
-
-        self.st_mod = tk.Label(sb, text="",
-                               bg=BG_STATUSBAR, fg=FG_YELLOW, font=("Segoe UI", 8))
+        self.st_mod  = tk.Label(sb, text="",
+                                bg=BG_STATUSBAR, fg=FG_YELLOW, font=("Segoe UI", 8))
         self.st_mod.pack(side="left")
-
-        self.st_pos = tk.Label(sb, text="Ln 1, Col 1",
-                               bg=BG_STATUSBAR, fg=FG_DIM, font=("Segoe UI", 8))
+        self.st_pos  = tk.Label(sb, text="Ln 1, Col 1",
+                                bg=BG_STATUSBAR, fg=FG_DIM, font=("Segoe UI", 8))
         self.st_pos.pack(side="right", padx=10)
-
-        self.st_cwd = tk.Label(sb, text=f"  {self._cwd}",
-                               bg=BG_STATUSBAR, fg=FG_DIM, font=("Segoe UI", 8))
+        self.st_cwd  = tk.Label(sb, text=f"  {self._cwd}",
+                                bg=BG_STATUSBAR, fg=FG_DIM, font=("Segoe UI", 8))
         self.st_cwd.pack(side="right", padx=10)
 
     # ────────────────────────────────────────────────────────
@@ -455,17 +509,16 @@ class BashForge:
         e = self.editor
         e.bind("<KeyRelease>",     self._on_edit)
         e.bind("<ButtonRelease>",  self._on_edit)
-        e.bind("<Control-s>",      lambda ev: (self.save_file(),   "break")[1])
-        e.bind("<Control-o>",      lambda ev: (self.open_file(),   "break")[1])
-        e.bind("<Control-n>",      lambda ev: (self.new_file(),    "break")[1])
-        e.bind("<Control-z>",      lambda ev:  e.edit_undo())
-        e.bind("<Control-y>",      lambda ev:  e.edit_redo())
+        e.bind("<Control-s>",      lambda ev: (self.save_file(),  "break")[1])
+        e.bind("<Control-o>",      lambda ev: (self.open_file(),  "break")[1])
+        e.bind("<Control-n>",      lambda ev: (self.new_file(),   "break")[1])
+        e.bind("<Control-z>",      lambda ev: e.edit_undo())
+        e.bind("<Control-y>",      lambda ev: e.edit_redo())
         e.bind("<Control-a>",      self._sel_all)
-        e.bind("<Control-slash>",  lambda ev:  self.toggle_comment())
-        e.bind("<Control-f>",      lambda ev:  self.open_find_bar())
-        e.bind("<Control-h>",      lambda ev:  self.open_find_bar())
-        e.bind("<Control-Return>",       lambda ev: self.run_script())
-        e.bind("<Control-Shift-Return>", lambda ev: self.run_with_input())
+        e.bind("<Control-slash>",  lambda ev: self.toggle_comment())
+        e.bind("<Control-f>",      lambda ev: self.open_find_bar())
+        e.bind("<Control-h>",      lambda ev: self.open_find_bar())
+        e.bind("<Control-Return>", lambda ev: self.run_script())
         e.bind("<Control-d>",      self._dup_line)
         e.bind("<Tab>",            self._tab)
         e.bind("<Shift-Tab>",      self._shift_tab)
@@ -492,19 +545,15 @@ class BashForge:
         self.st_cwd.config(text=f"  {self._cwd}")
 
     # ────────────────────────────────────────────────────────
-    #  Syntax highlight
+    #  Syntax highlighting
     # ────────────────────────────────────────────────────────
     def _syntax_highlight(self, _=None):
         src = self.editor.get("1.0", "end-1c")
         tag_fg = {
-            "kw":      FG_PURPLE,
-            "builtin": FG_CYAN,
-            "var":     FG_ORANGE,
-            "string":  FG_STRING,
-            "comment": FG_COMMENT,
-            "flag":    FG_YELLOW,
-            "number":  FG_GREEN,
-            "shebang": FG_DIM,
+            "kw":      FG_PURPLE,  "builtin": FG_CYAN,
+            "var":     FG_ORANGE,  "string":  FG_STRING,
+            "comment": FG_COMMENT, "flag":    FG_YELLOW,
+            "number":  FG_GREEN,   "shebang": FG_DIM,
             "op":      FG_RED,
         }
         for t, fg in tag_fg.items():
@@ -526,23 +575,16 @@ class BashForge:
         ]
         for tag, pat in patterns:
             for m in re.finditer(pat, src, re.MULTILINE):
-                s = f"1.0+{m.start()}c"
-                e = f"1.0+{m.end()}c"
-                self.editor.tag_add(tag, s, e)
-
-        # comments always win – apply last
+                self.editor.tag_add(tag, f"1.0+{m.start()}c", f"1.0+{m.end()}c")
         for m in re.finditer(r'(?m)(?<!\\)#(?!!)[^\n]*', src):
-            self.editor.tag_add("comment",
-                                f"1.0+{m.start()}c",
-                                f"1.0+{m.end()}c")
+            self.editor.tag_add("comment", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
 
     # ────────────────────────────────────────────────────────
     #  File operations
     # ────────────────────────────────────────────────────────
     def new_file(self):
-        if self.modified:
-            if not messagebox.askyesno("New File", "Discard unsaved changes?"):
-                return
+        if self.modified and not messagebox.askyesno("New File", "Discard unsaved changes?"):
+            return
         self.editor.delete("1.0", tk.END)
         self.editor.insert("1.0", "#!/bin/bash\n\nset -euo pipefail\n\n")
         self.current_file = None
@@ -552,8 +594,7 @@ class BashForge:
 
     def open_file(self):
         path = filedialog.askopenfilename(
-            filetypes=[("Shell scripts", "*.sh *.bash *.zsh"),
-                       ("All files", "*.*")])
+            filetypes=[("Shell scripts", "*.sh *.bash *.zsh"), ("All files", "*.*")])
         if not path:
             return
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -589,12 +630,10 @@ class BashForge:
         self._ow(f"Saved: {path}\n", "success")
 
     # ────────────────────────────────────────────────────────
-    #  Script execution
+    #  Script execution  –  pty on Linux, pipe fallback elsewhere
     # ────────────────────────────────────────────────────────
     def _write_temp_script(self):
-        """Write editor content to a temp .sh file with Unix line endings."""
         code = self.editor.get("1.0", tk.END)
-        # Force LF line endings – Windows CRLF breaks bash `read` variable names
         code = code.replace("\r\n", "\n").replace("\r", "\n")
         tmp = tempfile.NamedTemporaryFile(
             delete=False, suffix=".sh", mode="w",
@@ -607,240 +646,182 @@ class BashForge:
             pass
         return tmp.name
 
-    def _launch_runner(self, tmp_path, stdin_text=""):
-        """Spawn bash in a thread, streaming output to the output panel."""
-        self.clear_output()
-        label = "▶  Running script"
-        if stdin_text.strip():
-            label += " (with input)"
-        self._ow(f"{label}...\n", "info")
-        if stdin_text.strip():
-            for i, line in enumerate(stdin_text.strip().splitlines(), 1):
-                self._ow(f"  stdin[{i}]: {line}\n", "warn")
-            self._ow("\n", "stdout")
-        self.run_btn.config(text="▶  Running…", fg=FG_YELLOW)
-
-        def _runner():
-            try:
-                proc = subprocess.Popen(
-                    ["bash", tmp_path],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    cwd=self._cwd,
-                    preexec_fn=os.setsid if hasattr(os, "setsid") else None,
-                    text=True,
-                    bufsize=1,
-                )
-                self._run_proc = proc
-
-                def _read_stdout():
-                    for line in proc.stdout:
-                        self._out_queue.put(("stdout", line))
-                    proc.stdout.close()
-
-                def _read_stderr():
-                    for line in proc.stderr:
-                        self._out_queue.put(("stderr", line))
-                    proc.stderr.close()
-
-                t1 = threading.Thread(target=_read_stdout, daemon=True)
-                t2 = threading.Thread(target=_read_stderr, daemon=True)
-                t1.start(); t2.start()
-
-                # Feed stdin then close it so `read` commands unblock
-                if stdin_text:
-                    try:
-                        proc.stdin.write(stdin_text)
-                        if not stdin_text.endswith("\n"):
-                            proc.stdin.write("\n")
-                    except BrokenPipeError:
-                        pass
-                proc.stdin.close()
-
-                t1.join(); t2.join()
-                rc = proc.wait()
-                tag  = "success" if rc == 0 else "stderr"
-                icon = "✓" if rc == 0 else "✗"
-                self._out_queue.put((tag, f"\n{icon}  Exited with code {rc}\n"))
-
-            except FileNotFoundError:
-                self._out_queue.put(("stderr",
-                    "bash not found – run this on Ubuntu / WSL2.\n"))
-            except Exception as ex:
-                self._out_queue.put(("stderr", f"Error: {ex}\n"))
-            finally:
-                self._run_proc = None
-                self._out_queue.put(("_done", ""))
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-
-        threading.Thread(target=_runner, daemon=True).start()
-
     def run_script(self, _=None):
-        """Run script with no stdin (Ctrl+Enter shortcut / Run button)."""
-        self._launch_runner(self._write_temp_script(), stdin_text="")
+        if self._run_proc and self._run_proc.poll() is None:
+            self._ow("⚠  A script is already running. Stop it first.\n", "warn")
+            return
 
-    def run_with_input(self):
-        """Open the stdin dialog, then run the script."""
-        # Auto-detect read prompts in the script to hint the user
-        src = self.editor.get("1.0", tk.END)
-        prompts = re.findall(r'read\s+(?:-[a-zA-Z]+\s+)*(\w+)', src)
-
-        dlg = tk.Toplevel(self.root)
-        dlg.title("Run with Input")
-        dlg.configure(bg=BG_MAIN)
-        dlg.geometry("480x400")
-        dlg.resizable(True, True)
-        dlg.grab_set()          # modal
-        dlg.focus_set()
-
-        # ── header ────────────────────────────────────────────
-        hdr = tk.Frame(dlg, bg=BG_PANEL_HDR, height=36)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        tk.Label(hdr, text="  ▶  Run with Stdin Input",
-                 bg=BG_PANEL_HDR, fg=FG_ACCENT,
-                 font=("Segoe UI", 10, "bold")).pack(side="left", padx=8, pady=6)
-        tk.Frame(dlg, bg=BORDER, height=1).pack(fill="x")
-
-        # ── hint ──────────────────────────────────────────────
-        hint_text = ("Type one input value per line.\n"
-                     "They will be fed to your script in order as stdin.")
-        if prompts:
-            hint_text += f"\n\nDetected read variables: {', '.join(prompts)}"
-        tk.Label(dlg, text=hint_text,
-                 bg=BG_MAIN, fg=FG_DIM, font=("Segoe UI", 9),
-                 justify="left", anchor="w",
-                 wraplength=440).pack(fill="x", padx=14, pady=(10, 4))
-
-        # ── variable rows (one entry per detected `read` var) ─
-        var_frame = tk.Frame(dlg, bg=BG_MAIN)
-        var_frame.pack(fill="x", padx=14, pady=4)
-        entry_refs = {}
-
-        for var in prompts:
-            row = tk.Frame(var_frame, bg=BG_MAIN)
-            row.pack(fill="x", pady=2)
-            tk.Label(row, text=f"{var}:", bg=BG_MAIN, fg=FG_ORANGE,
-                     font=self.mono_font_sm, width=18,
-                     anchor="w").pack(side="left")
-            ent = tk.Entry(row, bg=ACTIVE_BG, fg=FG_DEFAULT,
-                           insertbackground=FG_ACCENT,
-                           font=self.mono_font_sm, relief="flat",
-                           highlightthickness=1,
-                           highlightcolor=FG_ACCENT,
-                           highlightbackground=BORDER)
-            ent.pack(side="left", fill="x", expand=True, padx=(4, 0))
-            entry_refs[var] = ent
-
-        # ── free-form fallback textarea ───────────────────────
-        sep_lbl = ("— or type raw stdin below (overrides fields above) —"
-                   if prompts else "— type raw stdin (one value per line) —")
-        tk.Label(dlg, text=sep_lbl,
-                 bg=BG_MAIN, fg=FG_COMMENT,
-                 font=("Segoe UI", 8)).pack(pady=(8, 2))
-
-        txt_frame = tk.Frame(dlg, bg=BG_MAIN)
-        txt_frame.pack(fill="both", expand=True, padx=14, pady=(0, 4))
-
-        raw_vscr = tk.Scrollbar(txt_frame, orient="vertical",
-                                bg=BG_TOOLBAR, troughcolor=BG_MAIN, width=10)
-        raw_vscr.pack(side="right", fill="y")
-
-        self._raw_input = tk.Text(
-            txt_frame,
-            bg=ACTIVE_BG, fg=FG_DEFAULT,
-            insertbackground=FG_ACCENT,
-            font=self.mono_font_sm,
-            relief="flat", padx=10, pady=6,
-            height=5,
-            yscrollcommand=raw_vscr.set,
-            borderwidth=0,
-            highlightthickness=1,
-            highlightcolor=FG_ACCENT,
-            highlightbackground=BORDER,
-        )
-        raw_vscr.config(command=self._raw_input.yview)
-        self._raw_input.pack(fill="both", expand=True)
-
-        # ── buttons ───────────────────────────────────────────
-        tk.Frame(dlg, bg=BORDER, height=1).pack(fill="x")
-        btn_row = tk.Frame(dlg, bg=BG_PANEL_HDR)
-        btn_row.pack(fill="x")
-
-        def _cancel():
-            dlg.destroy()
-
-        def _run():
-            # raw textarea takes priority if filled
-            raw = self._raw_input.get("1.0", tk.END).strip()
-            if raw:
-                stdin_text = raw + "\n"
-            elif entry_refs:
-                # build from individual field entries, in detection order
-                lines = [entry_refs[v].get() for v in prompts if v in entry_refs]
-                stdin_text = "\n".join(lines) + "\n"
-            else:
-                stdin_text = ""
-            dlg.destroy()
-            self._launch_runner(self._write_temp_script(), stdin_text)
-
-        def _mk_dlg_btn(parent, text, cmd, fg):
-            b = tk.Button(parent, text=text, command=cmd,
-                          bg=BG_PANEL_HDR, fg=fg,
-                          activebackground=ACTIVE_BG, activeforeground=fg,
-                          relief="flat", padx=18, pady=6,
-                          font=FONT_UI, cursor="hand2", borderwidth=0)
-            b.pack(side="right", padx=6, pady=6)
-            b.bind("<Enter>", lambda e: b.config(bg=HOVER_BG))
-            b.bind("<Leave>", lambda e: b.config(bg=BG_PANEL_HDR))
-
-        _mk_dlg_btn(btn_row, "Cancel",   _cancel, FG_DIM)
-        _mk_dlg_btn(btn_row, "▶  Run",   _run,    FG_GREEN)
-
-        # focus first entry or the textarea
-        if entry_refs:
-            list(entry_refs.values())[0].focus_set()
+        tmp_path = self._write_temp_script()
+        self.clear_output()
+        self._ow("▶  Running script...\n", "info")
+        if HAS_PTY:
+            self._ow("   (interactive mode – type input below ↓)\n\n", "warn")
         else:
-            self._raw_input.focus_set()
+            self._ow("   (pipe mode – type input below ↓ then Enter)\n\n", "warn")
+        self.run_btn.config(text="▶  Running…", fg=FG_YELLOW)
+        self.root.after(0, lambda: self._stdin_set_active(True))
 
-        dlg.bind("<Control-Return>", lambda e: _run())
-        dlg.bind("<Escape>",         lambda e: _cancel())
+        if HAS_PTY:
+            threading.Thread(target=self._run_pty,  args=(tmp_path,), daemon=True).start()
+        else:
+            threading.Thread(target=self._run_pipe, args=(tmp_path,), daemon=True).start()
+
+    # ── PTY runner (Linux) ────────────────────────────────────
+    def _run_pty(self, tmp_path):
+        master_fd = slave_fd = None
+        try:
+            master_fd, slave_fd = pty.openpty()
+            self._pty_master_fd = master_fd
+
+            proc = subprocess.Popen(
+                ["bash", tmp_path],
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                cwd=self._cwd,
+                preexec_fn=os.setsid,
+                close_fds=True,
+            )
+            self._run_proc = proc
+            os.close(slave_fd)
+            slave_fd = None
+
+            buf = b""
+            while True:
+                try:
+                    r, _, _ = select.select([master_fd], [], [], 0.05)
+                except (ValueError, OSError):
+                    break
+                if r:
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    # decode what we can, hold incomplete sequences
+                    text = buf.decode("utf-8", errors="replace")
+                    buf = b""
+                    # strip ANSI escape codes for clean display
+                    clean = re.sub(r'\x1b\[[0-9;]*[mABCDEFGHJKSTfhilmnprsu]', '', text)
+                    clean = re.sub(r'\x1b\][^\x07]*\x07', '', clean)
+                    clean = clean.replace('\r\n', '\n').replace('\r', '\n')
+                    if clean:
+                        self._out_queue.put(("stdout", clean))
+                else:
+                    if proc.poll() is not None:
+                        break
+
+            rc = proc.wait()
+            tag  = "success" if rc == 0 else "stderr"
+            icon = "✓" if rc == 0 else "✗"
+            self._out_queue.put((tag, f"\n{icon}  Exited with code {rc}\n"))
+
+        except Exception as ex:
+            self._out_queue.put(("stderr", f"Error: {ex}\n"))
+        finally:
+            self._run_proc       = None
+            self._pty_master_fd  = None
+            if slave_fd is not None:
+                try: os.close(slave_fd)
+                except OSError: pass
+            if master_fd is not None:
+                try: os.close(master_fd)
+                except OSError: pass
+            self._out_queue.put(("_done", ""))
+            try: os.unlink(tmp_path)
+            except OSError: pass
+
+    # ── Pipe runner (Windows / no pty) ───────────────────────
+    def _run_pipe(self, tmp_path):
+        try:
+            proc = subprocess.Popen(
+                ["bash", tmp_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=self._cwd,
+                preexec_fn=os.setsid if hasattr(os, "setsid") else None,
+                text=True, bufsize=1,
+            )
+            self._run_proc = proc
+
+            def _read_out():
+                for line in proc.stdout:
+                    self._out_queue.put(("stdout", line))
+                proc.stdout.close()
+
+            def _read_err():
+                for line in proc.stderr:
+                    self._out_queue.put(("stderr", line))
+                proc.stderr.close()
+
+            def _write_stdin():
+                """Forward lines from _stdin_queue to process stdin."""
+                while proc.poll() is None:
+                    try:
+                        line = self._stdin_queue.get(timeout=0.1)
+                        try:
+                            proc.stdin.write(line)
+                            proc.stdin.flush()
+                        except (BrokenPipeError, OSError):
+                            break
+                    except queue.Empty:
+                        continue
+                try: proc.stdin.close()
+                except OSError: pass
+
+            t1 = threading.Thread(target=_read_out,    daemon=True)
+            t2 = threading.Thread(target=_read_err,    daemon=True)
+            t3 = threading.Thread(target=_write_stdin, daemon=True)
+            t1.start(); t2.start(); t3.start()
+            t1.join(); t2.join()
+            rc = proc.wait()
+            tag  = "success" if rc == 0 else "stderr"
+            icon = "✓" if rc == 0 else "✗"
+            self._out_queue.put((tag, f"\n{icon}  Exited with code {rc}\n"))
+
+        except FileNotFoundError:
+            self._out_queue.put(("stderr",
+                "bash not found – run this on Ubuntu / WSL2.\n"))
+        except Exception as ex:
+            self._out_queue.put(("stderr", f"Error: {ex}\n"))
+        finally:
+            self._run_proc = None
+            self._out_queue.put(("_done", ""))
+            try: os.unlink(tmp_path)
+            except OSError: pass
 
     def stop_script(self):
         proc = self._run_proc
         if proc and proc.poll() is None:
             try:
-                # kill entire process group
                 if hasattr(os, "killpg"):
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 else:
                     proc.terminate()
             except Exception:
-                proc.terminate()
+                try: proc.terminate()
+                except Exception: pass
             self._ow("■  Script stopped by user.\n", "warn")
         else:
             self._ow("No script is currently running.\n", "warn")
 
-    # poll the output queue on the main thread
+    # ── output queue poll (runs on main thread every 40 ms) ──
     def _poll_output_queue(self):
         try:
             while True:
                 tag, text = self._out_queue.get_nowait()
                 if tag == "_done":
                     self.run_btn.config(text="▶  Run  Ctrl+↵", fg=FG_GREEN)
+                    self._stdin_set_active(False)
                 else:
                     self._ow(text, tag)
         except queue.Empty:
             pass
-        self.root.after(50, self._poll_output_queue)
+        self.root.after(40, self._poll_output_queue)
 
-    # ── output helpers ────────────────────────────────────────
+    # ── output panel helpers ──────────────────────────────────
     def _ow(self, text, tag="stdout"):
-        """Write to the OUTPUT panel."""
         self.output.config(state="normal")
         self.output.insert(tk.END, text, tag)
         self.output.see(tk.END)
@@ -852,10 +833,9 @@ class BashForge:
         self.output.config(state="disabled")
 
     # ────────────────────────────────────────────────────────
-    #  Interactive terminal
+    #  Interactive terminal (bottom-right)
     # ────────────────────────────────────────────────────────
     def _tw(self, text, tag="stdout"):
-        """Write to the TERMINAL panel."""
         self.terminal.config(state="normal")
         self.terminal.insert(tk.END, text, tag)
         self.terminal.see(tk.END)
@@ -875,7 +855,6 @@ class BashForge:
         self._term_hist_idx = len(self._term_hist)
         self._tw(f"$ {cmd}\n", "prompt")
 
-        # built-in: cd
         if cmd.startswith("cd"):
             parts = cmd.split(maxsplit=1)
             target = parts[1] if len(parts) > 1 else os.path.expanduser("~")
@@ -891,7 +870,6 @@ class BashForge:
                 self._tw(f"cd: {target}: No such directory\n", "stderr")
             return
 
-        # built-in: clear
         if cmd in ("clear", "cls"):
             self.clear_terminal()
             return
@@ -900,14 +878,10 @@ class BashForge:
             try:
                 proc = subprocess.Popen(
                     cmd, shell=True, cwd=self._cwd,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True,
-                )
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 out, err = proc.communicate(timeout=120)
-                if out:
-                    self.root.after(0, lambda o=out: self._tw(o, "stdout"))
-                if err:
-                    self.root.after(0, lambda e=err: self._tw(e, "stderr"))
+                if out: self.root.after(0, lambda o=out: self._tw(o, "stdout"))
+                if err: self.root.after(0, lambda e=err: self._tw(e, "stderr"))
             except subprocess.TimeoutExpired:
                 self.root.after(0, lambda: self._tw("Timed out.\n", "warn"))
             except Exception as ex:
@@ -954,7 +928,7 @@ class BashForge:
         return "break"
 
     # ────────────────────────────────────────────────────────
-    #  Editor smart keys
+    #  Editor smart-edit helpers
     # ────────────────────────────────────────────────────────
     def clear_editor(self):
         if messagebox.askyesno("Clear Editor", "Clear all content?"):
@@ -996,9 +970,8 @@ class BashForge:
         return "break"
 
     def _enter(self, _=None):
-        idx    = self.editor.index("insert")
-        ln     = int(idx.split(".")[0])
-        line   = self.editor.get(f"{ln}.0", f"{ln}.end")
+        ln   = int(self.editor.index("insert").split(".")[0])
+        line = self.editor.get(f"{ln}.0", f"{ln}.end")
         indent = re.match(r'^(\s*)', line).group(1)
         if line.rstrip().endswith(('then', 'do', 'else', 'elif', '{', '(')):
             indent += "    "
@@ -1039,13 +1012,10 @@ class BashForge:
             e = int(self.editor.index("sel.last").split(".")[0])
         except tk.TclError:
             s = e = int(self.editor.index("insert").split(".")[0])
-
-        lines = [self.editor.get(f"{ln}.0", f"{ln}.end") for ln in range(s, e + 1)]
+        lines = [self.editor.get(f"{ln}.0", f"{ln}.end") for ln in range(s, e+1)]
         all_commented = all(
-            l.lstrip().startswith("#") or not l.strip()
-            for l in lines if l.strip()
-        )
-        for i, ln in enumerate(range(s, e + 1)):
+            l.lstrip().startswith("#") or not l.strip() for l in lines if l.strip())
+        for i, ln in enumerate(range(s, e+1)):
             new = (re.sub(r'^(\s*)# ?', r'\1', lines[i], count=1)
                    if all_commented
                    else re.sub(r'^(\s*)', r'\1# ', lines[i], count=1))
@@ -1058,10 +1028,9 @@ class BashForge:
     #  Find / Replace
     # ────────────────────────────────────────────────────────
     def open_find_bar(self, _=None):
-        # pack BEFORE the h_pane (which is the first child after toolbar)
-        self.find_bar.pack(fill="x",
-                           after=self.root.nametowidget(
-                               self.root.winfo_children()[0]))  # after toolbar
+        children = self.root.winfo_children()
+        toolbar  = children[0]
+        self.find_bar.pack(fill="x", after=toolbar)
         self.find_entry.focus_set()
         try:
             sel = self.editor.get("sel.first", "sel.last")
@@ -1092,8 +1061,7 @@ class BashForge:
 
     def find_next(self, _=None):
         q = self.find_entry.get()
-        if not q:
-            return
+        if not q: return
         self._hl_all(q)
         idx = self.editor.search(q, self._search_idx, "end", nocase=True)
         if not idx:
@@ -1108,41 +1076,32 @@ class BashForge:
 
     def find_prev(self):
         q = self.find_entry.get()
-        if not q:
-            return
+        if not q: return
         idx = self.editor.search(q, "1.0", self._search_idx, nocase=True, backwards=True)
         if not idx:
             idx = self.editor.search(q, "1.0", "end", nocase=True, backwards=True)
         if idx:
-            end = f"{idx}+{len(q)}c"
             self.editor.tag_remove("sel", "1.0", "end")
-            self.editor.tag_add("sel", idx, end)
+            self.editor.tag_add("sel", idx, f"{idx}+{len(q)}c")
             self.editor.mark_set("insert", idx)
             self.editor.see(idx)
             self._search_idx = idx
 
     def replace_one(self):
-        q = self.find_entry.get()
-        r = self.replace_entry.get()
-        if not q:
-            return
+        q = self.find_entry.get();  r = self.replace_entry.get()
+        if not q: return
         try:
-            s = self.editor.index("sel.first")
-            e = self.editor.index("sel.last")
+            s = self.editor.index("sel.first");  e = self.editor.index("sel.last")
             if self.editor.get(s, e).lower() == q.lower():
-                self.editor.delete(s, e)
-                self.editor.insert(s, r)
-        except tk.TclError:
-            pass
+                self.editor.delete(s, e);  self.editor.insert(s, r)
+        except tk.TclError: pass
         self.find_next()
 
     def replace_all(self):
-        q = self.find_entry.get()
-        r = self.replace_entry.get()
-        if not q:
-            return
+        q = self.find_entry.get();  r = self.replace_entry.get()
+        if not q: return
         content = self.editor.get("1.0", "end-1c")
-        new = re.sub(re.escape(q), r, content, flags=re.IGNORECASE)
+        new     = re.sub(re.escape(q), r, content, flags=re.IGNORECASE)
         self.editor.delete("1.0", tk.END)
         self.editor.insert("1.0", new)
         self._on_edit()
@@ -1157,10 +1116,8 @@ class BashForge:
             self._snippet_win.lift()
             return
         win = tk.Toplevel(self.root)
-        win.title("Snippets")
-        win.configure(bg=BG_MAIN)
-        win.geometry("340x500")
-        win.resizable(False, True)
+        win.title("Snippets");  win.configure(bg=BG_MAIN)
+        win.geometry("340x500");  win.resizable(False, True)
         self._snippet_win = win
 
         tk.Label(win, text="  ⋯  DevOps Snippets",
@@ -1200,8 +1157,6 @@ class BashForge:
             self._snippet_win = None
 
 
-# ────────────────────────────────────────────────────────────
-#  Entry point
 # ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     root = tk.Tk()
