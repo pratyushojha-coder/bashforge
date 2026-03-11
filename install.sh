@@ -4,6 +4,10 @@ set -e
 
 echo "Installing BashForge..."
 
+# Install dependencies
+sudo apt update
+sudo apt install python3 python3-tk -y
+
 INSTALL_DIR="$HOME/.bashforge"
 BIN_DIR="/usr/local/bin"
 
@@ -23,6 +27,5 @@ sudo chmod +x $BIN_DIR/bashforge
 
 echo ""
 echo "✅ BashForge installed successfully!"
-echo ""
-echo "Run:"
+echo "Run using:"
 echo "bashforge"
