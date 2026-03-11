@@ -13,7 +13,7 @@ echo "  ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═
 echo ""
 echo "  DevOps Bash IDE — Installer v2"
 echo "you can contibute to https://github.com/pratyushojha-coder/bashforge"
-echo "Author : Pratyush Ojha"
+echo "Author : Pratyush Ojha "
 echo ""
 
 # ── OS guard ──────────────────────────────────────────────────────────────────
