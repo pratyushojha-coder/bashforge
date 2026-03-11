@@ -1,86 +1,122 @@
 #!/usr/bin/env python3
-import curses
+
+import tkinter as tk
+from tkinter import filedialog
 import subprocess
 
-code_buffer = []
-output_buffer = []
+class BashForge:
 
-def run_code():
-    global code_buffer, output_buffer
-    code = "\n".join(code_buffer)
+    def __init__(self, root):
+        self.root = root
+        self.root.title("BashForge - Bash Editor")
+        self.root.geometry("900x600")
 
-    try:
-        result = subprocess.run(
-            ["bash", "-c", code],
-            capture_output=True,
-            text=True
+        self.create_widgets()
+
+    def create_widgets(self):
+
+        # Toolbar
+        toolbar = tk.Frame(self.root, bg="#222")
+        toolbar.pack(side="top", fill="x")
+
+        run_btn = tk.Button(toolbar, text="Run", command=self.run_code)
+        run_btn.pack(side="left", padx=5, pady=5)
+
+        reset_btn = tk.Button(toolbar, text="Reset", command=self.reset_code)
+        reset_btn.pack(side="left", padx=5)
+
+        open_btn = tk.Button(toolbar, text="Open", command=self.open_file)
+        open_btn.pack(side="left", padx=5)
+
+        save_btn = tk.Button(toolbar, text="Save", command=self.save_file)
+        save_btn.pack(side="left", padx=5)
+
+        exit_btn = tk.Button(toolbar, text="Exit", command=self.root.quit)
+        exit_btn.pack(side="right", padx=5)
+
+        # Code editor
+        editor_frame = tk.Frame(self.root)
+        editor_frame.pack(fill="both", expand=True)
+
+        self.code_editor = tk.Text(
+            editor_frame,
+            bg="#1e1e1e",
+            fg="white",
+            insertbackground="white",
+            font=("Consolas", 12)
         )
 
-        output_buffer = (result.stdout + result.stderr).split("\n")
+        scrollbar = tk.Scrollbar(editor_frame, command=self.code_editor.yview)
+        self.code_editor.configure(yscrollcommand=scrollbar.set)
 
-    except Exception as e:
-        output_buffer = [str(e)]
+        scrollbar.pack(side="right", fill="y")
+        self.code_editor.pack(fill="both", expand=True)
 
+        # Output terminal
+        terminal_frame = tk.Frame(self.root, height=150)
+        terminal_frame.pack(fill="x")
 
-def reset_code():
-    global code_buffer, output_buffer
-    code_buffer = []
-    output_buffer = []
+        terminal_label = tk.Label(terminal_frame, text="Terminal Output")
+        terminal_label.pack(anchor="w")
 
+        self.output_box = tk.Text(
+            terminal_frame,
+            bg="black",
+            fg="lime",
+            height=10,
+            font=("Consolas", 11)
+        )
 
-def draw_ui(stdscr):
-    curses.curs_set(1)
+        self.output_box.pack(fill="x")
 
-    while True:
+    def run_code(self):
 
-        stdscr.clear()
-        height, width = stdscr.getmaxyx()
+        code = self.code_editor.get("1.0", tk.END)
 
-        stdscr.addstr(0, 2, "BashForge - Terminal Bash Editor", curses.A_BOLD)
+        try:
+            result = subprocess.run(
+                ["bash", "-c", code],
+                capture_output=True,
+                text=True
+            )
 
-        stdscr.addstr(2, 2, "[F5 RUN]", curses.A_REVERSE)
-        stdscr.addstr(2, 12, "[F6 RESET]", curses.A_REVERSE)
-        stdscr.addstr(2, 24, "[F10 EXIT]", curses.A_REVERSE)
+            output = result.stdout + result.stderr
 
-        stdscr.addstr(4, 2, "Code:")
+        except Exception as e:
+            output = str(e)
 
-        for i, line in enumerate(code_buffer):
-            stdscr.addstr(5 + i, 2, line)
+        self.output_box.delete("1.0", tk.END)
+        self.output_box.insert(tk.END, output)
 
-        stdscr.addstr(height // 2, 2, "Output:")
+    def reset_code(self):
 
-        for i, line in enumerate(output_buffer[:height//2 - 2]):
-            stdscr.addstr(height//2 + 1 + i, 2, line)
+        self.code_editor.delete("1.0", tk.END)
+        self.output_box.delete("1.0", tk.END)
 
-        stdscr.refresh()
+    def open_file(self):
 
-        key = stdscr.getch()
+        file_path = filedialog.askopenfilename()
 
-        if key == curses.KEY_F5:
-            run_code()
+        if file_path:
+            with open(file_path, "r") as f:
+                content = f.read()
 
-        elif key == curses.KEY_F6:
-            reset_code()
+            self.code_editor.delete("1.0", tk.END)
+            self.code_editor.insert(tk.END, content)
 
-        elif key == curses.KEY_F10:
-            break
+    def save_file(self):
 
-        elif key == 10:
-            code_buffer.append("")
+        file_path = filedialog.asksaveasfilename(defaultextension=".sh")
 
-        elif key == curses.KEY_BACKSPACE or key == 127:
-            if code_buffer:
-                code_buffer[-1] = code_buffer[-1][:-1]
+        if file_path:
+            code = self.code_editor.get("1.0", tk.END)
 
-        else:
-            if not code_buffer:
-                code_buffer.append("")
-            code_buffer[-1] += chr(key)
-
-
-def main():
-    curses.wrapper(draw_ui)
+            with open(file_path, "w") as f:
+                f.write(code)
 
 
 if __name__ == "__main__":
-    main()
+
+    root = tk.Tk()
+    app = BashForge(root)
+    root.mainloop()
