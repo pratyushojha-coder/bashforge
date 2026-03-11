@@ -1,14 +1,26 @@
 #!/bin/bash
 
+set -e
+
 echo "Installing BashForge..."
 
-mkdir -p ~/.bashforge
+INSTALL_DIR="$HOME/.bashforge"
+BIN_DIR="/usr/local/bin"
 
-cp bashforge.py ~/.bashforge/
+# Create directory
+mkdir -p $INSTALL_DIR
 
-chmod +x ~/.bashforge/bashforge.py
+# Download latest script
+curl -L https://raw.githubusercontent.com/pratyushojha-coder/bashforge/main/bashforge.py -o $INSTALL_DIR/bashforge.py
 
-sudo ln -s ~/.bashforge/bashforge.py /usr/local/bin/bashforge
+# Make executable
+chmod +x $INSTALL_DIR/bashforge.py
 
-echo "Installed! Run using:"
+# Create global command
+sudo ln -sf $INSTALL_DIR/bashforge.py $BIN_DIR/bashforge
+
+echo ""
+echo "✅ BashForge installed successfully!"
+echo "Run it using:"
+echo ""
 echo "bashforge"
